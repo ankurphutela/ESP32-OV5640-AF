@@ -58,6 +58,49 @@ uint8_t OV5640::focusInit() {
   return 0;
 }
 
+/* Coarse linear LUT {distance [mm] , VCM step} – last entry (∞) is 0 */
+static const struct { uint16_t d; uint16_t step; } dist_lut[] PROGMEM = {
+  { 50 , 1023 },   // 5 cm  (closest)
+  { 70 , 850  },
+  {100 , 680  },
+  {150 , 540  },
+  {250 , 400  },
+  {400 , 260  },
+  {800 , 120  },
+  {  0 ,   0  }    // 0 = default => infinity
+};
+
+uint8_t OV5640::manualFocus(uint16_t step)
+{
+  if (!isOV5640) return 2;
+  step &= 0x03FF;                       // 10-bit range
+
+  /* Write high / low parts of the desired position */
+  sensor->set_reg(sensor, OV5640_CMD_PARA3, 0xFF, step >> 8);
+  sensor->set_reg(sensor, OV5640_CMD_PARA4, 0xFF, step & 0xFF);
+
+  /* Kick the internal MCU – 0x05 = “move lens to PARA3/4” */
+  sensor->set_reg(sensor, OV5640_CMD_MAIN, 0xFF, AF_MOVE_LENS);
+
+  /* Wait for ACK to clear */
+  uint16_t retry = 0;
+  while (sensor->get_reg(sensor, OV5640_CMD_ACK, 0xFF) && retry++ < 1000)
+    delay(5);
+
+  return (retry >= 1000) ? 1 : 0;
+}
+
+uint8_t OV5640::manualFocusDistance(uint16_t distance_mm)
+{
+  /* Find nearest entry in LUT */
+  uint16_t step = 0;
+  for (uint8_t i = 0; dist_lut[i].d; ++i) {
+    if (distance_mm <= dist_lut[i].d) { step = dist_lut[i].step; break; }
+  }
+  return manualFocus(step);
+}
+
+
 uint8_t OV5640::autoFocusMode() {
   if (!isOV5640) return -1;
 
