@@ -18,6 +18,7 @@
 
 #define AF_TRIG_SINGLE_AUTO_FOCUS           0x03
 #define AF_CONTINUE_AUTO_FOCUS              0x04
+#define AF_MOVE_LENS                        0x05 
 
 #define FW_STATUS_S_FIRMWARE                0x7F
 #define FW_STATUS_S_STARTUP                 0x7E
