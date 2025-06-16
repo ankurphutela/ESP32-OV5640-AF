@@ -1,292 +1,206 @@
-/*
-  ESP32_OV5640_AF.cpp - Library for OV5640 Auto Focus (ESP32 Camera)
-  Modified version with Manual Focus support
-  Original Created by Eric Nam, December 23, 2021.
-  Released into the public domain.
-*/
+#include "ESP32_OV5640_AF_Manual.h"
 
-#include "Arduino.h"
-#include "ESP32_OV5640_AF.h"
-#include "OV5640_AF_firmware.h"
-
-OV5640::OV5640()
-{
-  sensor = NULL;
-  current_mode = AF_MODE_RELEASED;
-  current_focus_value = 0x0080;  // Default mid-range
-  min_focus_value = 0x0000;      // Infinity
-  max_focus_value = 0x01FF;      // Macro
+OV5640_Manual::OV5640_Manual() : OV5640() {
+    current_focus_position = OV5640_FOCUS_DEFAULT;
+    near_limit = OV5640_FOCUS_MIN;
+    far_limit = OV5640_FOCUS_MAX;
+    vcm_powered = false;
 }
 
-void OV5640::start(sensor_t* _sensor)
-{
-  sensor = _sensor;
+bool OV5640_Manual::initManualFocus() {
+    // Initialize VCM control
+    
+    // Set VCM clock divider for 20kHz operation
+    // Assuming 24MHz input clock: divider = 24000000 / 20000 = 1200
+    if (!writeVCMRegister(OV5640_REG_VCM_CONTROL_3, 0x04)) return false; // High byte
+    if (!writeVCMRegister(OV5640_REG_VCM_CONTROL_2, 0xB0)) return false; // Low byte
+    
+    // Set VCM current control (1.0x current)
+    if (!writeVCMRegister(OV5640_REG_VCM_CONTROL_4, 0x04)) return false;
+    
+    // Enable VCM power
+    if (!enableVCMPower(true)) return false;
+    
+    // Set initial focus position
+    if (!setManualFocus(OV5640_FOCUS_DEFAULT, OV5640_SLEW_SINGLE_200US)) return false;
+    
+    delay(100); // Allow time for initial positioning
+    
+    return true;
 }
 
-byte OV5640::sendCommand()
-{
-  if (!sensor) return -1;
-  
-  byte rdVal;
-  sensor->set_reg(sensor, 0x3022, 0xff, 0);
-  sensor->set_reg(sensor, 0x3023, 0xff, 0);
-  rdVal = sensor->get_reg(sensor, 0x3023, 0xff);
-  
-  if (rdVal != 0) {
-    return -1;
-  } else {
-    return 0;
-  }
+bool OV5640_Manual::setManualFocus(uint16_t position) {
+    return setManualFocus(position, OV5640_SLEW_SINGLE_200US);
 }
 
-byte OV5640::getFWStatus()
-{
-  if (!sensor) return -1;
-  
-  byte rdVal;
-  sensor->set_reg(sensor, 0x3029, 0xff, 0x7f);
-  rdVal = sensor->get_reg(sensor, 0x3029, 0xff);
-  
-  if (rdVal != 0x70) {
-    return -1;
-  } else {
-    return 0;
-  }
-}
-
-byte OV5640::focusInit()
-{
-  if (!sensor) return -1;
-  
-  // Load AF firmware
-  for (uint16_t i = 0; i < sizeof(OV5640_AF_firmware); i++) {
-    sensor->set_reg(sensor, 0x8000 + i, 0xff, OV5640_AF_firmware[i]);
-  }
-  
-  // Enable AF
-  sensor->set_reg(sensor, 0x3000, 0x20, 0x20);
-  sensor->set_reg(sensor, 0x3022, 0xff, 0x00);
-  
-  // Wait for firmware initialization
-  delay(10);
-  
-  return getFWStatus();
-}
-
-byte OV5640::autoFocusMode()
-{
-  if (!sensor) return -1;
-  
-  // Set continuous auto focus mode
-  sensor->set_reg(sensor, 0x3022, 0xff, 0x04);
-  sensor->set_reg(sensor, 0x3023, 0xff, 0x00);
-  sensor->set_reg(sensor, 0x3024, 0xff, 0x00);
-  sensor->set_reg(sensor, 0x3025, 0xff, 0x00);
-  sensor->set_reg(sensor, 0x3026, 0xff, 0x00);
-  sensor->set_reg(sensor, 0x3027, 0xff, 0x00);
-  sensor->set_reg(sensor, 0x3028, 0xff, 0x00);
-  sensor->set_reg(sensor, 0x3029, 0xff, 0x7f);
-  sensor->set_reg(sensor, 0x302a, 0xff, 0x00);
-  
-  current_mode = AF_MODE_AUTO_CONTINUOUS;
-  return sendCommand();
-}
-
-byte OV5640::infinityFocusMode()
-{
-  return setManualFocus(min_focus_value);
-}
-
-// New manual focus implementation
-byte OV5640::setFocusMode(focus_mode_t mode)
-{
-  if (!sensor) return -1;
-  
-  current_mode = mode;
-  
-  switch (mode) {
-    case AF_MODE_AUTO_CONTINUOUS:
-      return autoFocusMode();
-      
-    case AF_MODE_AUTO_SINGLE:
-      return triggerSingleAutoFocus();
-      
-    case AF_MODE_MANUAL:
-      return releaseFocus();
-      
-    case AF_MODE_RELEASED:
-      return releaseFocus();
-      
-    default:
-      return -1;
-  }
-}
-
-byte OV5640::setManualFocus(uint16_t focus_value)
-{
-  if (!sensor) return -1;
-  
-  // Constrain focus value to valid range
-  if (focus_value > max_focus_value) {
-    focus_value = max_focus_value;
-  }
-  
-  // Release autofocus first
-  releaseFocus();
-  
-  // Set focus position registers
-  sensor->set_reg(sensor, 0x3602, 0xff, (focus_value >> 8) & 0xff);
-  sensor->set_reg(sensor, 0x3603, 0xff, focus_value & 0xff);
-  
-  // Trigger manual focus
-  sensor->set_reg(sensor, 0x3022, 0xff, 0x03);
-  sensor->set_reg(sensor, 0x3023, 0xff, 0x01);
-  
-  // Store current value
-  current_focus_value = focus_value;
-  current_mode = AF_MODE_MANUAL;
-  
-  delay(10);  // Small delay for focus adjustment
-  
-  return sendCommand();
-}
-
-byte OV5640::triggerSingleAutoFocus()
-{
-  if (!sensor) return -1;
-  
-  // Release any current focus
-  releaseFocus();
-  
-  // Trigger single AF
-  sensor->set_reg(sensor, 0x3022, 0xff, 0x03);
-  sensor->set_reg(sensor, 0x3023, 0xff, 0x01);
-  
-  current_mode = AF_MODE_AUTO_SINGLE;
-  
-  // Wait for focus to complete (max 500ms)
-  for (int i = 0; i < 50; i++) {
-    if (getFocusStatus() == AF_STATUS_FOCUSED) {
-      // Read back the focus value
-      current_focus_value = getCurrentFocusValue();
-      return 0;
+bool OV5640_Manual::setManualFocus(uint16_t position, uint8_t slew_rate) {
+    if (position > OV5640_FOCUS_MAX) {
+        position = OV5640_FOCUS_MAX;
     }
-    delay(10);
-  }
-  
-  return -1;  // Focus timeout
+    
+    if (!vcm_powered) {
+        if (!enableVCMPower(true)) return false;
+    }
+    
+    // Split 10-bit position into high and low parts
+    uint8_t position_high = (position >> 4) & 0x3F;  // Bits [9:4] in lower 6 bits
+    uint8_t position_low = (position & 0x0F) << 4;   // Bits [3:0] in upper 4 bits
+    
+    // Set VCM control register 1 (high bits + power control)
+    uint8_t vcm_ctrl1 = position_high;  // Bit[7] = 0 (power on), Bit[5:0] = position[9:4]
+    if (!writeVCMRegister(OV5640_REG_VCM_CONTROL_1, vcm_ctrl1)) return false;
+    
+    // Set VCM control register 0 (low bits + slew rate)
+    uint8_t vcm_ctrl0 = position_low | (slew_rate & 0x0F);
+    if (!writeVCMRegister(OV5640_REG_VCM_CONTROL_0, vcm_ctrl0)) return false;
+    
+    current_focus_position = position;
+    
+    // Wait for focus movement to complete
+    return waitForFocusComplete();
 }
 
-byte OV5640::releaseFocus()
-{
-  if (!sensor) return -1;
-  
-  // Release focus command
-  sensor->set_reg(sensor, 0x3022, 0xff, 0x08);
-  sensor->set_reg(sensor, 0x3023, 0xff, 0x01);
-  
-  current_mode = AF_MODE_RELEASED;
-  
-  return sendCommand();
+uint16_t OV5640_Manual::getManualFocus() {
+    if (!vcm_powered) return 0;
+    
+    uint8_t high = readVCMRegister(OV5640_REG_VCM_CONTROL_1);
+    uint8_t low = readVCMRegister(OV5640_REG_VCM_CONTROL_0);
+    
+    uint16_t position = ((high & 0x3F) << 4) | ((low >> 4) & 0x0F);
+    current_focus_position = position;
+    
+    return position;
 }
 
-uint16_t OV5640::getCurrentFocusValue()
-{
-  if (!sensor) return 0;
-  
-  uint8_t high = sensor->get_reg(sensor, 0x3602, 0xff);
-  uint8_t low = sensor->get_reg(sensor, 0x3603, 0xff);
-  
-  return (high << 8) | low;
+bool OV5640_Manual::releaseManualFocus() {
+    // Power down VCM
+    return enableVCMPower(false);
 }
 
-focus_status_t OV5640::getFocusStatus()
-{
-  if (!sensor) return AF_STATUS_IDLE;
-  
-  uint8_t status = sensor->get_reg(sensor, 0x3029, 0xff);
-  
-  // Decode status bits
-  if (status & 0x10) {
-    return AF_STATUS_FOCUSED;
-  } else if (status & 0x20) {
-    return AF_STATUS_FOCUSING;
-  } else if (status & 0x40) {
-    return AF_STATUS_NOT_FOCUSED;
-  }
-  
-  return AF_STATUS_IDLE;
+bool OV5640_Manual::enableVCMPower(bool enable) {
+    uint8_t vcm_ctrl1 = readVCMRegister(OV5640_REG_VCM_CONTROL_1);
+    
+    if (enable) {
+        vcm_ctrl1 &= ~0x80;  // Clear bit 7 (power on)
+        vcm_powered = true;
+    } else {
+        vcm_ctrl1 |= 0x80;   // Set bit 7 (power down)
+        vcm_powered = false;
+    }
+    
+    return writeVCMRegister(OV5640_REG_VCM_CONTROL_1, vcm_ctrl1);
 }
 
-byte OV5640::calibrateFocusRange()
-{
-  if (!sensor) return -1;
-  
-  // Find minimum focus (infinity)
-  setManualFocus(0x0000);
-  delay(100);
-  min_focus_value = getCurrentFocusValue();
-  
-  // Find maximum focus (macro)
-  setManualFocus(0x01FF);
-  delay(100);
-  max_focus_value = getCurrentFocusValue();
-  
-  // Return to middle focus
-  setManualFocus((min_focus_value + max_focus_value) / 2);
-  
-  return 0;
+bool OV5640_Manual::setFocusNear() {
+    return setManualFocus(near_limit);
 }
 
-uint16_t OV5640::getMinFocusValue()
-{
-  return min_focus_value;
+bool OV5640_Manual::setFocusFar() {
+    return setManualFocus(far_limit);
 }
 
-uint16_t OV5640::getMaxFocusValue()
-{
-  return max_focus_value;
+bool OV5640_Manual::setFocusMid() {
+    uint16_t mid_position = (near_limit + far_limit) / 2;
+    return setManualFocus(mid_position);
 }
 
-uint16_t OV5640::mapDistanceToFocus(uint16_t distance_mm)
-{
-  // Map distance in mm to focus value
-  // This is approximate and may need calibration
-  // Close distance = higher focus value
-  // Far distance = lower focus value
-  
-  if (distance_mm < 100) {
-    // Macro range
-    return max_focus_value;
-  } else if (distance_mm > 10000) {
-    // Infinity
-    return min_focus_value;
-  } else {
-    // Linear interpolation (inverse relationship)
-    // You may want to use a logarithmic scale for better results
-    uint32_t range = max_focus_value - min_focus_value;
-    uint32_t mapped = range - (range * (distance_mm - 100) / 9900);
-    return min_focus_value + mapped;
-  }
+bool OV5640_Manual::focusStep(int8_t steps) {
+    int32_t new_position = current_focus_position + (steps * 10);
+    
+    if (new_position < near_limit) new_position = near_limit;
+    if (new_position > far_limit) new_position = far_limit;
+    
+    return setManualFocus((uint16_t)new_position);
 }
 
-// Internal helper functions
-byte OV5640::writeReg16(uint16_t reg, uint16_t value)
-{
-  if (!sensor) return -1;
-  
-  sensor->set_reg(sensor, reg, 0xff, (value >> 8) & 0xff);
-  sensor->set_reg(sensor, reg + 1, 0xff, value & 0xff);
-  
-  return 0;
+bool OV5640_Manual::calibrateNearLimit() {
+    // Move to minimum position and test image sharpness
+    uint16_t best_position = OV5640_FOCUS_MIN;
+    uint32_t best_sharpness = 0;
+    
+    for (uint16_t pos = OV5640_FOCUS_MIN; pos < OV5640_FOCUS_MIN + 200; pos += 10) {
+        setManualFocus(pos);
+        delay(100);
+        
+        uint32_t sharpness = calculateSharpness();
+        if (sharpness > best_sharpness) {
+            best_sharpness = sharpness;
+            best_position = pos;
+        }
+    }
+    
+    near_limit = best_position;
+    return setManualFocus(near_limit);
 }
 
-uint16_t OV5640::readReg16(uint16_t reg)
-{
-  if (!sensor) return 0;
-  
-  uint8_t high = sensor->get_reg(sensor, reg, 0xff);
-  uint8_t low = sensor->get_reg(sensor, reg + 1, 0xff);
-  
-  return (high << 8) | low;
+bool OV5640_Manual::calibrateFarLimit() {
+    // Move to maximum position and test image sharpness
+    uint16_t best_position = OV5640_FOCUS_MAX;
+    uint32_t best_sharpness = 0;
+    
+    for (uint16_t pos = OV5640_FOCUS_MAX - 200; pos <= OV5640_FOCUS_MAX; pos += 10) {
+        setManualFocus(pos);
+        delay(100);
+        
+        uint32_t sharpness = calculateSharpness();
+        if (sharpness > best_sharpness) {
+            best_sharpness = sharpness;
+            best_position = pos;
+        }
+    }
+    
+    far_limit = best_position;
+    return setManualFocus(far_limit);
+}
+
+uint16_t OV5640_Manual::findOptimalFocus(uint8_t window_size) {
+    uint16_t best_position = current_focus_position;
+    uint32_t best_sharpness = 0;
+    
+    uint16_t start_pos = (current_focus_position > window_size * 10) ? 
+                        current_focus_position - window_size * 10 : near_limit;
+    uint16_t end_pos = (current_focus_position < far_limit - window_size * 10) ? 
+                      current_focus_position + window_size * 10 : far_limit;
+    
+    for (uint16_t pos = start_pos; pos <= end_pos; pos += 5) {
+        setManualFocus(pos);
+        delay(50);
+        
+        uint32_t sharpness = calculateSharpness();
+        if (sharpness > best_sharpness) {
+            best_sharpness = sharpness;
+            best_position = pos;
+        }
+    }
+    
+    setManualFocus(best_position);
+    return best_position;
+}
+
+// Private helper functions
+bool OV5640_Manual::writeVCMRegister(uint16_t reg, uint8_t value) {
+    return wrSensorReg16_8(reg, value) == 0;
+}
+
+uint8_t OV5640_Manual::readVCMRegister(uint16_t reg) {
+    uint8_t value = 0;
+    rdSensorReg16_8(reg, &value);
+    return value;
+}
+
+bool OV5640_Manual::waitForFocusComplete(uint32_t timeout_ms) {
+    uint32_t start_time = millis();
+    
+    // For manual focus, we just wait a reasonable time based on slew rate
+    // In a real implementation, you might monitor focus status registers
+    delay(100);  // Basic settling time
+    
+    return (millis() - start_time) < timeout_ms;
+}
+
+uint32_t OV5640_Manual::calculateSharpness() {
+    // Simplified sharpness calculation
+    // In a real implementation, you would analyze image data
+    // This is a placeholder that returns a random value for demonstration
+    return random(1000, 10000);
 }
